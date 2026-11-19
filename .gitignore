@@ -1,0 +1,25 @@
+# R session and workspace files
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio project and user-specific settings
+.Rproj.user/
+*.Rproj
+
+# Knitted/generated output (keep the source R Markdown file)
+*_cache/
+*_files/
+
+# Temporary and backup files
+*.tmp
+*.bak
+*~
+.DS_Store
+Thumbs.db
+
+# Local datasets and sensitive/local files
+*.csv
+*.xlsx
+*.xls
+.env

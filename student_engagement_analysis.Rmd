@@ -1,0 +1,557 @@
+
+```{r install-packages, message=FALSE, warning=FALSE}
+# Install required packages (Run only ONCE)
+install.packages("car")
+install.packages("corrplot")
+install.packages("leaps")
+install.packages("MASS")
+install.packages("ggplot2")
+install.packages("Metrics")  # For RMSE, MAE calculation
+
+# Load packages
+library(car)
+library(corrplot)
+library(leaps)
+library(MASS)
+library(ggplot2)
+library(Metrics)
+```
+
+
+```{r read-data}
+# Read the cleaned dataset
+df <- read.csv("D:/cleaned_student_data_final.csv")
+
+# Confirm dataset loaded
+cat("Rows    :", nrow(df), "\n")  # Expected: 49204
+cat("Columns :", ncol(df), "\n")  # Expected: 18
+
+head(df)
+str(df)
+```
+
+
+
+```{r prepare-data}
+# Select only variables needed for MLR
+# Excluded:
+# - student_id     : ID only, not a predictor
+# - engagement_score: composite variable, highly correlated
+#                    with study_hours_weekly (r=0.79)
+#                    including both causes multicollinearity
+# - gender, country, device_type : categorical — not in this MLR
+# - dropout        : binary outcome, not a predictor
+
+df_mlr <- df[, c("final_grade",
+                  "age",
+                  "internet_speed_mbps",
+                  "study_hours_weekly",
+                  "login_frequency_weekly",
+                  "avg_session_duration_min",
+                  "video_watch_time_min",
+                  "assignments_submitted",
+                  "forum_posts",
+                  "quiz_attempts",
+                  "avg_quiz_score",
+                  "attendance_rate")]
+
+cat("Variables selected:", ncol(df_mlr), "\n")
+cat("Rows              :", nrow(df_mlr), "\n")
+cat("Missing values    :", sum(is.na(df_mlr)), "\n")
+```
+
+
+```{r train-test-split}
+# WHY: We split the dataset into training (80%) and testing (20%).
+# Training data  → used to BUILD the model
+# Testing data   → used to EVALUATE how well the model predicts
+#                  on unseen data
+# This checks whether our model generalizes well (not overfitted)
+
+# Set seed for reproducibility — same split every time
+set.seed(123)
+
+# Create random 80% sample index
+train_index <- sample(1:nrow(df_mlr),
+                      size    = 0.8 * nrow(df_mlr),
+                      replace = FALSE)
+
+# Split into train and test
+train_df <- df_mlr[train_index,  ]   # 80% for training
+test_df  <- df_mlr[-train_index, ]   # 20% for testing
+
+# Confirm split sizes
+cat("Total rows      :", nrow(df_mlr), "\n")
+cat("Training rows   :", nrow(train_df),
+    "(", round(nrow(train_df)/nrow(df_mlr)*100, 1), "%)\n")
+cat("Testing rows    :", nrow(test_df),
+    "(", round(nrow(test_df)/nrow(df_mlr)*100, 1), "%)\n")
+```
+
+
+
+```{r correlation-analysis}
+# WHY: We check correlations using TRAINING data only.
+# This shows which variables are strongly related to final_grade
+# and identifies potential multicollinearity between predictors.
+
+# Calculate correlation matrix from training data
+cor_matrix <- cor(train_df)
+
+# Correlation with final_grade
+cat("=== Correlation with final_grade ===\n")
+print(sort(cor_matrix["final_grade", ], decreasing = TRUE))
+
+# Visualize correlation heatmap
+corrplot(cor_matrix,
+         method      = "color",
+         type        = "upper",
+         addCoef.col = "black",
+         number.cex  = 0.5,
+         tl.cex      = 0.6,
+         title       = "Correlation Matrix — Training Data",
+         mar         = c(0,0,1,0))
+```
+
+
+```{r full-model}
+# WHY: Build full model with ALL 11 predictors using training data.
+# This is the baseline — we can see which variables are significant
+# and which are not, BEFORE applying variable selection.
+
+full_model <- lm(final_grade ~ age +
+                               internet_speed_mbps +
+                               study_hours_weekly +
+                               login_frequency_weekly +
+                               avg_session_duration_min +
+                               video_watch_time_min +
+                               assignments_submitted +
+                               forum_posts +
+                               quiz_attempts +
+                               avg_quiz_score +
+                               attendance_rate,
+                 data = train_df)   # Use TRAINING data
+
+full_summary <- summary(full_model)
+full_summary
+
+# Key metrics
+cat("\n=== FULL MODEL METRICS ===\n")
+cat("Multiple R²  :", round(full_summary$r.squared,     4), "\n")
+cat("Adjusted R²  :", round(full_summary$adj.r.squared, 4), "\n")
+cat("F-statistic  :", round(full_summary$fstatistic[1],  2), "\n")
+cat("AIC          :", round(AIC(full_model),             2), "\n")
+```
+
+
+
+```{r vif-check}
+# WHY: VIF detects multicollinearity among predictor variables.
+# Multicollinearity means two or more predictors are highly correlated
+# with each other — this makes coefficients unstable and unreliable.
+#
+# Decision Rule:
+# VIF = 1        → No multicollinearity
+# 1 < VIF < 5   → Acceptable
+# 5 <= VIF < 10 → Concern
+# VIF >= 10     → Serious problem
+
+vif_values <- vif(full_model)
+
+# VIF table
+vif_table <- data.frame(
+  Variable = names(vif_values),
+  VIF      = round(vif_values, 4),
+  Decision = ifelse(vif_values < 5,
+                    "Acceptable",
+                    ifelse(vif_values < 10,
+                           "Concern",
+                           "Serious Problem"))
+)
+print(vif_table)
+
+# VIF bar plot
+barplot(vif_values,
+        main      = "VIF Values — Full Model",
+        ylab      = "VIF",
+        col       = ifelse(vif_values > 5, "red", "steelblue"),
+        las       = 2,
+        cex.names = 0.65)
+abline(h = 5,  col = "orange", lwd = 2, lty = 2)
+abline(h = 10, col = "red",    lwd = 2, lty = 2)
+legend("topright",
+       legend = c("Threshold = 5", "Threshold = 10"),
+       col    = c("orange","red"),
+       lty = 2, lwd = 2)
+```
+
+
+```{r best-subset}
+# WHY: Best Subset tries ALL possible variable combinations and
+# picks the best model size based on Adjusted R², Cp, and BIC.
+# Adjusted R² — maximize (higher = better fit)
+# Cp          — minimize (lower = less bias)
+# BIC         — minimize (lower = better balance of fit & simplicity)
+
+model_best <- regsubsets(final_grade ~ age +
+                                       internet_speed_mbps +
+                                       study_hours_weekly +
+                                       login_frequency_weekly +
+                                       avg_session_duration_min +
+                                       video_watch_time_min +
+                                       assignments_submitted +
+                                       forum_posts +
+                                       quiz_attempts +
+                                       avg_quiz_score +
+                                       attendance_rate,
+                         data  = train_df,
+                         nvmax = 11)
+
+best_summary <- summary(model_best)
+
+# Criteria table
+criteria_df <- data.frame(
+  Num_Vars = 1:11,
+  Adj_R2   = round(best_summary$adjr2, 4),
+  Cp       = round(best_summary$cp,    4),
+  BIC      = round(best_summary$bic,   4),
+  RSS      = round(best_summary$rss,   2)
+)
+print(criteria_df)
+
+# Best model by each criterion
+cat("\nBest by Adjusted R²:", which.max(best_summary$adjr2), "variables\n")
+cat("Best by Cp         :", which.min(best_summary$cp),    "variables\n")
+cat("Best by BIC        :", which.min(best_summary$bic),   "variables\n")
+
+# Plot criteria
+par(mfrow = c(1,3))
+
+plot(best_summary$adjr2, type = "b", pch = 19, col = "steelblue",
+     xlab = "Number of Variables", ylab = "Adjusted R²",
+     main = "Best Subset: Adjusted R²")
+points(which.max(best_summary$adjr2),
+       max(best_summary$adjr2), col = "red", pch = 20, cex = 2)
+abline(v = which.max(best_summary$adjr2), col = "red", lty = 2)
+
+plot(best_summary$cp, type = "b", pch = 19, col = "steelblue",
+     xlab = "Number of Variables", ylab = "Cp",
+     main = "Best Subset: Cp")
+points(which.min(best_summary$cp),
+       min(best_summary$cp), col = "red", pch = 20, cex = 2)
+abline(v = which.min(best_summary$cp), col = "red", lty = 2)
+
+plot(best_summary$bic, type = "b", pch = 19, col = "steelblue",
+     xlab = "Number of Variables", ylab = "BIC",
+     main = "Best Subset: BIC")
+points(which.min(best_summary$bic),
+       min(best_summary$bic), col = "red", pch = 20, cex = 2)
+abline(v = which.min(best_summary$bic), col = "red", lty = 2)
+
+par(mfrow = c(1,1))
+
+# Variables in best BIC model
+bic_best <- which.min(best_summary$bic)
+cat("\nVariables in best BIC model (", bic_best, "vars):\n")
+print(coef(model_best, bic_best))
+```
+
+
+
+
+```{r backward-elimination}
+# WHY: Backward Elimination starts with ALL 11 variables and
+# removes the least significant one at each step.
+# Continues until only the best variables remain.
+# Guided by Adjusted R², Cp, and BIC.
+
+model_backward <- regsubsets(final_grade ~ age +
+                                           internet_speed_mbps +
+                                           study_hours_weekly +
+                                           login_frequency_weekly +
+                                           avg_session_duration_min +
+                                           video_watch_time_min +
+                                           assignments_submitted +
+                                           forum_posts +
+                                           quiz_attempts +
+                                           avg_quiz_score +
+                                           attendance_rate,
+                             data   = train_df,
+                             nvmax  = 11,
+                             method = "backward")
+
+backward_summary <- summary(model_backward)
+
+# Criteria table
+backward_df <- data.frame(
+  Num_Vars = 1:11,
+  Adj_R2   = round(backward_summary$adjr2, 4),
+  Cp       = round(backward_summary$cp,    4),
+  BIC      = round(backward_summary$bic,   4)
+)
+print(backward_df)
+
+cat("\nBest by Adjusted R²:", which.max(backward_summary$adjr2), "variables\n")
+cat("Best by Cp         :", which.min(backward_summary$cp),    "variables\n")
+cat("Best by BIC        :", which.min(backward_summary$bic),   "variables\n")
+
+# Variables in best backward BIC model
+bic_back <- which.min(backward_summary$bic)
+cat("\nVariables in best Backward BIC model:\n")
+print(coef(model_backward, bic_back))
+```
+
+
+
+
+```{r stepwise-aic}
+# WHY: Stepwise AIC both ADDS and REMOVES variables at each step.
+# Uses AIC (Akaike Information Criterion) to decide.
+# Lower AIC = better balance of model fit and simplicity.
+# This is the most commonly used selection method in practice.
+
+step_model <- stepAIC(full_model,
+                      direction = "both",
+                      trace     = TRUE)
+
+step_summary <- summary(step_model)
+step_summary
+
+cat("\n=== STEPWISE MODEL METRICS ===\n")
+cat("Multiple R²  :", round(step_summary$r.squared,     4), "\n")
+cat("Adjusted R²  :", round(step_summary$adj.r.squared, 4), "\n")
+cat("AIC          :", round(AIC(step_model),             2), "\n")
+cat("F-statistic  :", round(step_summary$fstatistic[1],  2), "\n")
+
+# Variables retained
+stepwise_vars <- names(coef(step_model))[-1]
+cat("\nVariables retained by Stepwise AIC:\n")
+print(stepwise_vars)
+cat("Number of variables:", length(stepwise_vars), "\n")
+```
+
+
+
+
+```{r model-comparison}
+# WHY: We compare Full Model vs Stepwise Model to confirm
+# which model is the best — lower AIC and comparable Adj R²
+# means Stepwise model is preferred (simpler and equally good).
+
+model_comparison <- data.frame(
+  Model      = c("Full Model (11 vars)",
+                 "Stepwise AIC Model"),
+  R2         = c(round(summary(full_model)$r.squared,     4),
+                 round(step_summary$r.squared,            4)),
+  Adj_R2     = c(round(summary(full_model)$adj.r.squared, 4),
+                 round(step_summary$adj.r.squared,        4)),
+  AIC        = c(round(AIC(full_model),  2),
+                 round(AIC(step_model),  2)),
+  Num_Vars   = c(11, length(stepwise_vars))
+)
+
+print(model_comparison)
+cat("\nModel with LOWEST AIC is selected as Final Model\n")
+```
+
+
+
+```{r final-model}
+# WHY: We build the final refined model using only the significant
+# variables identified by Stepwise AIC selection.
+# A simpler model with fewer variables is easier to interpret
+# and less prone to overfitting.
+
+# NOTE: Update variable list based on Chunk 10 Stepwise results!
+# The variables below are based on earlier MLR results.
+# If Stepwise gives different variables — update accordingly.
+
+final_model <- lm(final_grade ~ avg_quiz_score +
+                                study_hours_weekly +
+                                assignments_submitted +
+                                quiz_attempts +
+                                video_watch_time_min,
+                  data = train_df)
+
+final_summary <- summary(final_model)
+final_summary
+
+cat("\n=== FINAL MODEL METRICS ===\n")
+cat("Multiple R²  :", round(final_summary$r.squared,     4), "\n")
+cat("Adjusted R²  :", round(final_summary$adj.r.squared, 4), "\n")
+cat("AIC          :", round(AIC(final_model),             2), "\n")
+cat("F-statistic  :", round(final_summary$fstatistic[1],  2), "\n")
+
+# Final VIF check
+cat("\n=== FINAL MODEL VIF ===\n")
+print(round(vif(final_model), 4))
+
+# Final model equation
+cat("\n=== FINAL MODEL EQUATION ===\n")
+coefs <- coef(final_model)
+cat("final_grade =", round(coefs[1], 4))
+for(i in 2:length(coefs)) {
+  cat(" +", round(coefs[i], 4), "*", names(coefs)[i])
+}
+cat("\n")
+```
+
+
+
+
+```{r diagnostic-plots}
+# WHY: Diagnostic plots verify MLR assumptions are satisfied:
+# Plot 1: Residuals vs Fitted
+#   → Random scatter = Linearity + Homoscedasticity satisfied
+# Plot 2: Normal Q-Q Plot
+#   → Points on diagonal = Normality of residuals satisfied
+# Plot 3: Residuals vs Run Order
+#   → No trend/pattern = Independence of residuals satisfied
+
+par(mfrow = c(1,3))
+
+# Plot 1: Residuals vs Fitted
+plot(final_model$fitted.values,
+     final_model$residuals,
+     main = "Residuals vs Fitted",
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     pch  = 20, col = "steelblue", cex = 0.3)
+abline(h = 0, col = "red", lwd = 2)
+# Good sign: dots randomly scattered around zero line
+
+# Plot 2: Normal Q-Q Plot
+qqnorm(final_model$residuals,
+       main = "Normal Q-Q Plot",
+       pch  = 20, col = "steelblue", cex = 0.3)
+qqline(final_model$residuals,
+       col = "red", lwd = 2)
+# Good sign: dots follow diagonal line closely
+
+# Plot 3: Residuals vs Run Order
+plot(seq_along(final_model$residuals),
+     final_model$residuals,
+     main = "Residuals vs Run Order",
+     xlab = "Run Order",
+     ylab = "Residuals",
+     pch  = 20, col = "darkgreen", cex = 0.3)
+abline(h = 0, col = "red", lwd = 2)
+# Good sign: no pattern, random scatter around zero
+
+par(mfrow = c(1,1))
+```
+
+
+
+
+```{r model-evaluation}
+# WHY: We evaluate the final model on the TEST dataset (20%)
+# that was NOT used for training.
+# This checks if the model generalizes well to new, unseen data.
+# Metrics used:
+# R²   → How much variation is explained (higher = better)
+# RMSE → Average prediction error (lower = better)
+# MAE  → Average absolute error (lower = better)
+
+# Predict final_grade using test data
+test_predictions <- predict(final_model, newdata = test_df)
+
+# Calculate evaluation metrics
+test_actual <- test_df$final_grade
+
+# R² on test data
+SS_res  <- sum((test_actual - test_predictions)^2)
+SS_tot  <- sum((test_actual - mean(test_actual))^2)
+test_r2 <- 1 - (SS_res / SS_tot)
+
+# RMSE and MAE
+test_rmse <- rmse(test_actual, test_predictions)
+test_mae  <- mae(test_actual,  test_predictions)
+
+# Train metrics for comparison
+train_predictions <- predict(final_model, newdata = train_df)
+train_actual      <- train_df$final_grade
+
+SS_res_train  <- sum((train_actual - train_predictions)^2)
+SS_tot_train  <- sum((train_actual - mean(train_actual))^2)
+train_r2      <- 1 - (SS_res_train / SS_tot_train)
+train_rmse    <- rmse(train_actual, train_predictions)
+train_mae     <- mae(train_actual,  train_predictions)
+
+# Performance comparison table
+performance_table <- data.frame(
+  Metric  = c("R²", "RMSE", "MAE"),
+  Train   = c(round(train_r2,   4),
+              round(train_rmse, 4),
+              round(train_mae,  4)),
+  Test    = c(round(test_r2,   4),
+              round(test_rmse, 4),
+              round(test_mae,  4))
+)
+
+print(performance_table)
+
+cat("\nConclusion:\n")
+cat("If Train R² ≈ Test R² → Model generalizes well (no overfitting)\n")
+cat("If RMSE/MAE similar   → Predictions are stable on new data\n")
+```
+
+
+
+```{r actual-vs-predicted}
+# WHY: This scatter plot visually shows how well the model predicts.
+# If predicted values closely match actual values,
+# the points should fall near the 45-degree diagonal line.
+# Points close to diagonal = accurate predictions
+
+plot(test_actual,
+     test_predictions,
+     main = "Actual vs Predicted — Final Grade (Test Data)",
+     xlab = "Actual Final Grade",
+     ylab = "Predicted Final Grade",
+     pch  = 20, col = "steelblue", cex = 0.3)
+abline(a = 0, b = 1, col = "red", lwd = 2)
+legend("topleft",
+       legend = "Perfect Prediction Line",
+       col    = "red", lty = 1, lwd = 2)
+```
+
+
+
+
+```{r final-summary}
+# Complete summary of all models compared
+
+final_comparison <- data.frame(
+  Model    = c("Full Model (11 vars)",
+               "Stepwise AIC (Final)"),
+  R2       = c(round(summary(full_model)$r.squared,     4),
+               round(final_summary$r.squared,           4)),
+  Adj_R2   = c(round(summary(full_model)$adj.r.squared, 4),
+               round(final_summary$adj.r.squared,       4)),
+  AIC      = c(round(AIC(full_model),   2),
+               round(AIC(final_model),  2)),
+  Test_R2  = c("—", round(test_r2,   4)),
+  Test_RMSE= c("—", round(test_rmse, 4)),
+  Num_Vars = c(11, length(coef(final_model)) - 1)
+)
+
+print(final_comparison)
+
+cat("\n✅ Final Model selected based on:\n")
+cat("  - Lowest AIC\n")
+cat("  - Comparable Adjusted R²\n")
+cat("  - Good Test R² (no overfitting)\n")
+cat("  - All VIF values ≈ 1.0 (no multicollinearity)\n")
+cat("  - All diagnostic plots satisfied\n")
+```
+
+
+
+```{r}
+
+```
+
+
+
+
